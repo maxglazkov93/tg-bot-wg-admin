@@ -1,0 +1,4 @@
+python-telegram-bot==20.7
+paramiko==3.4.0
+python-dotenv==1.0.0
+schedule==1.2.0 
