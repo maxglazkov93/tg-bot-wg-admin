@@ -67,6 +67,27 @@ class WireGuardBot:
             logger.error(f"Ошибка чтения файла {path}: {e}")
             return None
 
+    def restart_wireguard(self):
+        """Перезапускает WireGuard интерфейс"""
+        try:
+            # Останавливаем интерфейс
+            result = subprocess.run(["wg-quick", "down", "wg0"], capture_output=True, text=True)
+            if result.returncode != 0:
+                logger.error(f"Ошибка остановки wg0: {result.stderr}")
+                return False
+            
+            # Запускаем интерфейс
+            result = subprocess.run(["wg-quick", "up", "wg0"], capture_output=True, text=True)
+            if result.returncode != 0:
+                logger.error(f"Ошибка запуска wg0: {result.stderr}")
+                return False
+            
+            logger.info("WireGuard интерфейс успешно перезапущен")
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка перезапуска WireGuard: {e}")
+            return False
+
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if str(update.effective_chat.id) != str(self.chat_id):
             await update.message.reply_text("У вас нет доступа к этому боту.")
@@ -165,7 +186,13 @@ class WireGuardBot:
         # Перезаписываем wg0.conf
         with open('/etc/wireguard/wg0.conf', 'w') as f:
             f.write('\n'.join(new_lines) + '\n')
-        await update.message.reply_text(f"Конфиг клиента {name} удалён (файл и блок в wg0.conf)")
+        
+        # Перезапускаем WireGuard для применения изменений
+        await update.message.reply_text("🔄 Перезапуск WireGuard интерфейса...")
+        if self.restart_wireguard():
+            await update.message.reply_text(f"✅ Клиент {name} успешно удалён и WireGuard перезапущен")
+        else:
+            await update.message.reply_text(f"⚠️ Клиент {name} удалён, но произошла ошибка при перезапуске WireGuard")
 
     def find_client_comment_in_wg0(self, peer_pubkey):
         lines = self.read_file('/etc/wireguard/wg0.conf')
