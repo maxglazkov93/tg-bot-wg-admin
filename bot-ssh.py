@@ -94,7 +94,7 @@ class WireGuardBot:
             return
         reply_markup = ReplyKeyboardMarkup(MENU_BUTTONS, resize_keyboard=True)
         await update.message.reply_text(
-            "🔐 WireGuard Manager Bot (Локальный)\n\nВыберите действие:",
+            "🔐 WireGuard Manager Bot\n\nВыберите действие:",
             reply_markup=reply_markup
         )
 
@@ -285,17 +285,17 @@ class WireGuardBot:
         application.add_handler(CommandHandler("start", self.start))
         application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), self.menu_handler))
         application.add_handler(CallbackQueryHandler(self.menu_handler))
-        print("🤖 WireGuard Bot (Локальный) запущен...")
+        print("🤖 WireGuard Bot запущен...")
         application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
-    # Загружаем конфигурацию
+    # Загрузите токен и chat_id из вашего файла конфигурации или переменных окружения
+    # Пример:
+    # bot_token = os.environ["BOT_TOKEN"]
+    # chat_id = os.environ["CHAT_ID"]
+    # Или загрузите из файла, как раньше
     from config import load_config
     config = load_config()
-    if not config:
-        print("❌ Не удалось загрузить конфигурацию из api_token.txt")
-        exit(1)
-    
     bot_token = config["BOT_TOKEN"]
     chat_id = config["CHAT_ID"]
     bot = WireGuardBot(bot_token, chat_id)
