@@ -257,10 +257,65 @@ class WireGuardBot:
                 return c
         return None
 
+    def get_wg_config_files(self):
+        """Получает список файлов конфигураций клиентов"""
+        try:
+            result = subprocess.run(["ls", "/etc/wireguard/clients/"], capture_output=True, text=True)
+            if result.returncode == 0:
+                files = [f.strip() for f in result.stdout.split('\n') if f.strip()]
+                return files
+            return []
+        except Exception as e:
+            logger.error(f"Ошибка получения файлов конфигураций: {e}")
+            return []
+
+    def parse_config_file_info(self, config_path):
+        """Парсит информацию из файла конфигурации клиента"""
+        try:
+            lines = self.read_file(config_path)
+            if not lines:
+                return None
+                
+            config_info = {
+                'filename': os.path.basename(config_path),
+                'path': config_path,
+                'client_name': None,
+                'public_key': None,
+                'allowed_ips': None,
+                'endpoint': None
+            }
+            
+            # Получаем время создания файла
+            try:
+                result = subprocess.run(["stat", "-c", "%y", config_path], capture_output=True, text=True)
+                if result.returncode == 0:
+                    config_info['created_time'] = result.stdout.strip()
+            except:
+                pass
+            
+            # Парсим содержимое конфигурации
+            for line in lines:
+                line = line.strip()
+                if line.startswith('#') and 'name' in line.lower():
+                    config_info['client_name'] = line.split('#')[1].strip()
+                elif line.startswith('PublicKey ='):
+                    config_info['public_key'] = line.split('=')[1].strip()
+                elif line.startswith('AllowedIPs ='):
+                    config_info['allowed_ips'] = line.split('=')[1].strip()
+                elif line.startswith('Endpoint ='):
+                    config_info['endpoint'] = line.split('=')[1].strip()
+                    
+            return config_info
+        except Exception as e:
+            logger.error(f"Ошибка парсинга файла {config_path}: {e}")
+            return None
+
     def monitoring_loop(self, bot):
         prev_peers = set()
+        prev_config_files = set()
         while True:
             try:
+                # Мониторинг активных peer'ов
                 current_peers = self.get_current_peers()
                 new_peers = current_peers - prev_peers
                 if new_peers:
@@ -275,7 +330,26 @@ class WireGuardBot:
                     prev_peers = current_peers
                 else:
                     prev_peers = current_peers
-                time.sleep(60)
+                
+                # Мониторинг новых файлов конфигураций
+                current_config_files = set(self.get_wg_config_files())
+                new_config_files = current_config_files - prev_config_files
+                if new_config_files:
+                    for config_file in new_config_files:
+                        if config_file.endswith('.conf'):
+                            # Получаем информацию о новом клиенте
+                            config_info = self.parse_config_file_info(f"/etc/wireguard/clients/{config_file}")
+                            if config_info:
+                                import asyncio
+                                asyncio.run_coroutine_threadsafe(
+                                    self.send_new_client_notification(None, config_info, bot=bot),
+                                    self.application.loop
+                                )
+                    prev_config_files = current_config_files
+                else:
+                    prev_config_files = current_config_files
+                
+                time.sleep(30)  # Проверяем каждые 30 секунд
             except Exception as e:
                 logger.error(f"Ошибка в цикле мониторинга: {e}")
                 time.sleep(60)
