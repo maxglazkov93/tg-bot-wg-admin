@@ -350,6 +350,9 @@ class WireGuardBot:
             return None
 
     def monitoring_loop(self, bot):
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         prev_peers = set()
         prev_config_files = set()
         while True:
@@ -361,10 +364,8 @@ class WireGuardBot:
                     for peer in new_peers:
                         config = self.get_peer_info(peer)
                         if config:
-                            import asyncio
-                            asyncio.run_coroutine_threadsafe(
-                                self.send_new_client_notification(None, config, bot=bot),
-                                self.application.loop
+                            loop.run_until_complete(
+                                self.send_new_client_notification(None, config, bot=bot)
                             )
                     prev_peers = current_peers
                 else:
@@ -376,13 +377,10 @@ class WireGuardBot:
                 if new_config_files:
                     for config_file in new_config_files:
                         if config_file.endswith('.conf'):
-                            # Получаем информацию о новом клиенте
                             config_info = self.parse_config_file_info(f"/etc/wireguard/clients/{config_file}")
                             if config_info:
-                                import asyncio
-                                asyncio.run_coroutine_threadsafe(
-                                    self.send_new_client_notification(None, config_info, bot=bot),
-                                    self.application.loop
+                                loop.run_until_complete(
+                                    self.send_new_client_notification(None, config_info, bot=bot)
                                 )
                     prev_config_files = current_config_files
                 else:
