@@ -6,8 +6,10 @@ from datetime import datetime
 import time
 import threading
 from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters, JobQueue
 from telegram.constants import ParseMode
+import paramiko
+import tempfile
 
 # Настройка логирования
 logging.basicConfig(
@@ -22,34 +24,76 @@ MENU_BUTTONS = [
 ]
 
 class WireGuardBot:
-    def __init__(self, bot_token, chat_id):
+    def __init__(self, bot_token, chat_id, ssh_host, ssh_port, ssh_username, ssh_password):
         self.bot_token = bot_token
         self.chat_id = chat_id
         self.delete_client_mode = False
         self.application = Application.builder().token(self.bot_token).build()
+        self.ssh_host = ssh_host
+        self.ssh_port = ssh_port
+        self.ssh_username = ssh_username
+        self.ssh_password = ssh_password
+        self.ssh_client = None
+        self.debug_log_path = '/tmp/wg_bot_debug.log'
         threading.Thread(target=self.monitoring_loop, args=(self.application.bot,), daemon=True).start()
 
-    def get_wg_configs(self):
+    def debug_log(self, msg):
+        print(f"{datetime.now()} | {msg}")
+
+    def ssh_connect(self):
+        if self.ssh_client is not None:
+            return self.ssh_client
         try:
-            result = subprocess.run(["wg", "show"], capture_output=True, text=True)
-            output = result.stdout
-            configs = []
-            current_peer = None
-            for line in output.split('\n'):
-                if line.startswith('peer:'):
-                    if current_peer:
-                        configs.append(current_peer)
-                    current_peer = {'peer': line.split(':')[1].strip()}
-                elif current_peer and line.strip():
-                    if ':' in line:
-                        key, value = line.split(':', 1)
-                        current_peer[key.strip()] = value.strip()
-            if current_peer:
-                configs.append(current_peer)
-            return configs
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(
+                hostname=self.ssh_host,
+                port=self.ssh_port,
+                username=self.ssh_username,
+                password=self.ssh_password,
+                timeout=10
+            )
+            self.ssh_client = client
+            return client
         except Exception as e:
-            logger.error(f"Ошибка получения конфигов wg: {e}")
+            print(f"[DEBUG] Ошибка подключения к SSH: {e}")
+            self.ssh_client = None
+            return None
+
+    def ssh_exec(self, command):
+        client = self.ssh_connect()
+        if not client:
+            return None
+        try:
+            stdin, stdout, stderr = client.exec_command(command)
+            output = stdout.read().decode('utf-8')
+            error = stderr.read().decode('utf-8')
+            if error:
+                print(f"[DEBUG] Ошибка выполнения команды по SSH: {error}")
+            return output
+        except Exception as e:
+            print(f"[DEBUG] Ошибка выполнения команды по SSH: {e}")
+            return None
+
+    def get_wg_configs(self):
+        output = self.ssh_exec("wg show")
+        print(f"[DEBUG] wg show output: {output}")
+        if not output:
             return []
+        configs = []
+        current_peer = None
+        for line in output.split('\n'):
+            if line.startswith('peer:'):
+                if current_peer:
+                    configs.append(current_peer)
+                current_peer = {'peer': line.split(':')[1].strip()}
+            elif current_peer and line.strip():
+                if ':' in line:
+                    key, value = line.split(':', 1)
+                    current_peer[key.strip()] = value.strip()
+        if current_peer:
+            configs.append(current_peer)
+        return configs
 
     def get_wg_interface_status(self):
         try:
@@ -60,12 +104,10 @@ class WireGuardBot:
             return None
 
     def read_file(self, path):
-        try:
-            with open(path, 'r') as f:
-                return f.readlines()
-        except Exception as e:
-            logger.error(f"Ошибка чтения файла {path}: {e}")
+        output = self.ssh_exec(f"cat {path}")
+        if output is None:
             return None
+        return output.splitlines(keepends=True)
 
     def restart_wireguard(self):
         """Перезапускает WireGuard интерфейс"""
@@ -118,7 +160,7 @@ class WireGuardBot:
 
     async def show_status_menu(self, update, context):
         try:
-            status = self.get_wg_interface_status()
+            status = self.ssh_exec("wg show")
             if status:
                 await update.message.reply_text(
                     f"📊 Статус WireGuard:\n\n<pre>{status}</pre>",
@@ -133,14 +175,28 @@ class WireGuardBot:
         try:
             configs = self.get_wg_configs()
             if configs:
+                wg0_lines = self.read_file('/etc/wireguard/wg0.conf')
                 message = "👥 <b>Список клиентов WireGuard:</b>\n\n"
                 for i, config in enumerate(configs, 1):
                     peer = config.get('peer', 'Неизвестно')
                     latest_handshake = config.get('latest handshake', 'Нет данных')
                     transfer = config.get('transfer', 'Нет данных')
-                    message += f"<b>{i}. Peer:</b> <code>{peer[:20]}...</code>\n"
-                    message += f"   📡 Последний handshake: {latest_handshake}\n"
-                    message += f"   📊 Трафик: {transfer}\n\n"
+                    # Поиск имени клиента по публичному ключу (аналогично find_client_name_by_pubkey)
+                    client_name = None
+                    if peer and wg0_lines:
+                        for idx, line in enumerate(wg0_lines):
+                            if line.strip().startswith('PublicKey') and peer in line:
+                                for j in range(idx-1, idx-3, -1):
+                                    if j >= 0 and wg0_lines[j].strip().lower().startswith('# client:'):
+                                        client_name = wg0_lines[j].strip()[9:].strip()
+                                        # print(f"[DEBUG] Найден client_name для peer {peer}: {client_name}")
+                                        break
+                                break
+                    message += f"<b>{i}. Peer:</b> <code>{peer[:20]}...</code>"
+                    if client_name:
+                        message += f"\n   📝 Имя конфига: <b>{client_name}</b>"
+                    message += f"\n   📡 Последний handshake: {latest_handshake}"
+                    message += f"\n   📊 Трафик: {transfer}\n\n"
                 await update.message.reply_text(message, parse_mode=ParseMode.HTML)
             else:
                 await update.message.reply_text("📭 Нет активных клиентов")
@@ -153,46 +209,44 @@ class WireGuardBot:
         if not name:
             await update.message.reply_text("Имя не может быть пустым. Операция отменена.")
             return
-        # Удаляем .conf файл локально
+        # Удаляем .conf файл по SSH
         conf_path = f"/etc/wireguard/clients/{name}.conf"
-        if os.path.exists(conf_path):
-            os.remove(conf_path)
-        else:
+        rm_result = self.ssh_exec(f"rm -f {conf_path}")
+        # Проверяем, был ли файл
+        ls_result = self.ssh_exec(f"ls {conf_path}")
+        if ls_result:
             await update.message.reply_text(f"Клиент с именем {name} не найден (файл не удалён).")
             return
-        # Удаляем блок из wg0.conf
+        # Удаляем блок из wg0.conf по SSH
         await self.delete_client_block_from_wg0(update, context, name)
 
     async def delete_client_block_from_wg0(self, update, context, name):
-        lines = self.read_file('/etc/wireguard/wg0.conf')
-        if not lines:
-            await update.message.reply_text("Не удалось прочитать wg0.conf")
-            return
-        new_lines = []
-        skip = 0
-        found = False
-        for i, line in enumerate(lines):
-            if skip > 0:
-                skip -= 1
-                continue
-            if line.strip().lower().startswith(f"# client: {name.lower()}"):
-                found = True
-                skip = 3
-                continue
-            new_lines.append(line.rstrip('\n'))
-        if not found:
-            await update.message.reply_text(f"Блок клиента с именем {name} не найден в wg0.conf.")
-            return
-        # Перезаписываем wg0.conf
-        with open('/etc/wireguard/wg0.conf', 'w') as f:
-            f.write('\n'.join(new_lines) + '\n')
-        
-        # Перезапускаем WireGuard для применения изменений
-        await update.message.reply_text("🔄 Перезапуск WireGuard интерфейса...")
-        if self.restart_wireguard():
-            await update.message.reply_text(f"✅ Клиент {name} успешно удалён и WireGuard перезапущен")
-        else:
-            await update.message.reply_text(f"⚠️ Клиент {name} удалён, но произошла ошибка при перезапуске WireGuard")
+        try:
+            # Проверяем, есть ли такой клиент в wg0.conf
+            lines = self.read_file('/etc/wireguard/wg0.conf')
+            found = False
+            if lines:
+                for line in lines:
+                    if line.strip().lower() == f"# client: {name.lower()}":
+                        found = True
+                        break
+            if not found:
+                await update.message.reply_text(f"Клиент с именем {name} не найден в wg0.conf.")
+                return
+            # Удаляем блок клиента по имени через awk по SSH (ваш вариант)
+            awk_cmd = (
+                f"awk 'BEGIN {{ del=0 }} /^# *[Cc]lient: *{name}$/ {{ del=1; next }} /^# *[Cc]lient:/ {{ if (del) {{ del=0 }} }} /^# *[Cc]lient:/ && del==0 {{ print; next }} !del' /etc/wireguard/wg0.conf > /etc/wireguard/wg0.conf.tmp && mv /etc/wireguard/wg0.conf.tmp /etc/wireguard/wg0.conf"
+            )
+            self.ssh_exec(awk_cmd)
+            # Перезапускаем WireGuard для применения изменений по SSH
+            await update.message.reply_text("🔄 Перезапуск WireGuard интерфейса...")
+            restart_result = self.ssh_exec("wg-quick down wg0 && wg-quick up wg0")
+            if restart_result is not None:
+                await update.message.reply_text(f"✅ Клиент {name} успешно удалён и WireGuard перезапущен")
+            else:
+                await update.message.reply_text(f"⚠️ Клиент {name} удалён, но произошла ошибка при перезапуске WireGuard")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Ошибка при удалении клиента: {e}")
 
     def find_client_comment_in_wg0(self, peer_pubkey):
         lines = self.read_file('/etc/wireguard/wg0.conf')
@@ -217,15 +271,48 @@ class WireGuardBot:
             pass
         return None
 
+    def find_client_name_by_pubkey(self, pubkey):
+        """Ищет имя клиента по публичному ключу в wg0.conf (# Client: ... за 2 строки выше PublicKey)"""
+        lines = self.read_file('/etc/wireguard/wg0.conf')
+        if not lines:
+            return None
+        for i, line in enumerate(lines):
+            if line.strip().startswith('PublicKey') and pubkey in line:
+                # Ищем # Client: ... максимум за 2 строки выше
+                for j in range(i-1, i-3, -1):
+                    if j >= 0 and lines[j].strip().lower().startswith('# client:'):
+                        return lines[j].strip()[9:].strip()  # Обрезаем '# Client:'
+        return None
+
+    def get_pubkey_to_name_map(self):
+        """Возвращает словарь pubkey -> client_name для всех клиентов из wg0.conf по SSH"""
+        lines = self.read_file('/etc/wireguard/wg0.conf')
+        pubkey_to_name = {}
+        if not lines:
+            return pubkey_to_name
+        current_name = None
+        for line in lines:
+            l = line.strip()
+            if l.lower().startswith('# client:'):
+                current_name = l[9:].strip()
+            elif l.startswith('PublicKey'):
+                pubkey = l.split('=', 1)[-1].strip()
+                if current_name:
+                    pubkey_to_name[pubkey] = current_name
+                current_name = None
+            elif l.startswith('[Peer]'):
+                current_name = None
+        return pubkey_to_name
+
     async def send_new_client_notification(self, context, config, bot=None):
+        print(f"[DEBUG] Вызвана send_new_client_notification с config: {config}")
+        pubkey = config.get('peer')
+        client_name = self.find_client_name_by_pubkey(pubkey) if pubkey else None
         message = "🆕 <b>Новый клиент WireGuard!</b>\n\n"
-        client_comment = None
-        if config.get('peer'):
-            client_comment = self.find_client_comment_in_wg0(config['peer'])
-        if client_comment:
-            message += f"📝 <b>Имя клиента:</b> {client_comment}\n"
-        if config.get('peer'):
-            message += f"🔑 <b>Публичный ключ:</b> <code>{config['peer'][:20]}...</code>\n"
+        if client_name:
+            message += f"📝 <b>Имя клиента:</b> {client_name}\n"
+        if pubkey:
+            message += f"🔑 <b>Публичный ключ:</b> <code>{pubkey[:20]}...</code>\n"
         if config.get('client_name'):
             message += f"👤 <b>Клиент:</b> {config['client_name']}\n"
         if config.get('public_key') and not config.get('peer'):
@@ -239,12 +326,21 @@ class WireGuardBot:
             tg_bot = context.bot
         elif bot:
             tg_bot = bot
+        # print(f"[DEBUG] tg_bot: {tg_bot}")
         if tg_bot:
-            await tg_bot.send_message(
-                chat_id=self.chat_id,
-                text=message,
-                parse_mode=ParseMode.HTML
-            )
+            try:
+                await tg_bot.send_message(
+                    chat_id=self.chat_id,
+                    text=message,
+                    parse_mode=ParseMode.HTML
+                )
+                # print(f"[DEBUG] Сообщение отправлено: {message}")
+            except Exception as e:
+                # print(f"[DEBUG] Ошибка при отправке сообщения: {e}")
+                pass
+        else:
+            # print("[DEBUG] tg_bot не определён, сообщение не отправлено")
+            pass
 
     def get_current_peers(self):
         configs = self.get_wg_configs()
@@ -258,26 +354,26 @@ class WireGuardBot:
         return None
 
     def monitoring_loop(self, bot):
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         prev_peers = set()
         while True:
             try:
                 current_peers = self.get_current_peers()
                 new_peers = current_peers - prev_peers
+                # self.debug_log(f"monitoring_loop: current_peers={current_peers}, prev_peers={prev_peers}, new_peers={new_peers}")
                 if new_peers:
                     for peer in new_peers:
                         config = self.get_peer_info(peer)
                         if config:
-                            import asyncio
-                            asyncio.run_coroutine_threadsafe(
-                                self.send_new_client_notification(None, config, bot=bot),
-                                self.application.loop
-                            )
+                            loop.run_until_complete(self.send_new_client_notification(None, config, bot=bot))
                     prev_peers = current_peers
                 else:
                     prev_peers = current_peers
                 time.sleep(60)
             except Exception as e:
-                logger.error(f"Ошибка в цикле мониторинга: {e}")
+                # self.debug_log(f"Ошибка в monitoring_loop: {e}")
                 time.sleep(60)
 
     def run(self):
@@ -286,6 +382,7 @@ class WireGuardBot:
         application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), self.menu_handler))
         application.add_handler(CallbackQueryHandler(self.menu_handler))
         print("🤖 WireGuard Bot запущен...")
+        # self.debug_log("WireGuard Bot запущен...")
         application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
@@ -298,5 +395,9 @@ if __name__ == '__main__':
     config = load_config()
     bot_token = config["BOT_TOKEN"]
     chat_id = config["CHAT_ID"]
-    bot = WireGuardBot(bot_token, chat_id)
+    ssh_host = config["SSH_HOST"]
+    ssh_port = config["SSH_PORT"]
+    ssh_username = config["SSH_USERNAME"]
+    ssh_password = config["SSH_PASSWORD"]
+    bot = WireGuardBot(bot_token, chat_id, ssh_host, ssh_port, ssh_username, ssh_password)
     bot.run() 

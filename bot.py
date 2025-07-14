@@ -133,14 +133,27 @@ class WireGuardBot:
         try:
             configs = self.get_wg_configs()
             if configs:
+                wg0_lines = self.read_file('/etc/wireguard/wg0.conf')
                 message = "👥 <b>Список клиентов WireGuard:</b>\n\n"
                 for i, config in enumerate(configs, 1):
                     peer = config.get('peer', 'Неизвестно')
                     latest_handshake = config.get('latest handshake', 'Нет данных')
                     transfer = config.get('transfer', 'Нет данных')
-                    message += f"<b>{i}. Peer:</b> <code>{peer[:20]}...</code>\n"
-                    message += f"   📡 Последний handshake: {latest_handshake}\n"
-                    message += f"   📊 Трафик: {transfer}\n\n"
+                    # Поиск имени клиента по публичному ключу (аналогично find_client_name_by_pubkey)
+                    client_name = None
+                    if peer and wg0_lines:
+                        for idx, line in enumerate(wg0_lines):
+                            if line.strip().startswith('PublicKey') and peer in line:
+                                for j in range(idx-1, idx-3, -1):
+                                    if j >= 0 and wg0_lines[j].strip().lower().startswith('# client:'):
+                                        client_name = wg0_lines[j].strip()[9:].strip()
+                                        break
+                                break
+                    message += f"<b>{i}. Peer:</b> <code>{peer[:20]}...</code>"
+                    if client_name:
+                        message += f"\n   📝 Имя конфига: <b>{client_name}</b>"
+                    message += f"\n   📡 Последний handshake: {latest_handshake}"
+                    message += f"\n   📊 Трафик: {transfer}\n\n"
                 await update.message.reply_text(message, parse_mode=ParseMode.HTML)
             else:
                 await update.message.reply_text("📭 Нет активных клиентов")
@@ -160,6 +173,17 @@ class WireGuardBot:
         else:
             await update.message.reply_text(f"Клиент с именем {name} не найден (файл не удалён).")
             return
+        # Проверяем, есть ли такой клиент в wg0.conf
+        lines = self.read_file('/etc/wireguard/wg0.conf')
+        found = False
+        if lines:
+            for line in lines:
+                if line.strip().lower() == f"# client: {name.lower()}":
+                    found = True
+                    break
+        if not found:
+            await update.message.reply_text(f"Клиент с именем {name} не найден в wg0.conf.")
+            return
         # Удаляем блок из wg0.conf
         await self.delete_client_block_from_wg0(update, context, name)
 
@@ -177,16 +201,20 @@ class WireGuardBot:
                 continue
             if line.strip().lower().startswith(f"# client: {name.lower()}"):
                 found = True
-                skip = 3
+                # Универсально: удаляем до следующего # client: или конца файла
+                skip = 0
+                for j in range(i+1, len(lines)):
+                    if lines[j].strip().lower().startswith('# client:'):
+                        break
+                    skip += 1
                 continue
             new_lines.append(line.rstrip('\n'))
         if not found:
             await update.message.reply_text(f"Блок клиента с именем {name} не найден в wg0.conf.")
             return
         # Перезаписываем wg0.conf
-        with open('/etc/wireguard/wg0.conf', 'w') as f:
+        with open('/etc/wireguard/wg0.conf', 'w', encoding='utf-8') as f:
             f.write('\n'.join(new_lines) + '\n')
-        
         # Перезапускаем WireGuard для применения изменений
         await update.message.reply_text("🔄 Перезапуск WireGuard интерфейса...")
         if self.restart_wireguard():
@@ -221,7 +249,18 @@ class WireGuardBot:
         message = "🆕 <b>Новый клиент WireGuard!</b>\n\n"
         client_comment = None
         if config.get('peer'):
-            client_comment = self.find_client_comment_in_wg0(config['peer'])
+            # Поиск имени клиента по публичному ключу (аналогично find_client_name_by_pubkey)
+            lines = self.read_file('/etc/wireguard/wg0.conf')
+            peer_pubkey = config['peer']
+            client_comment = None
+            if lines:
+                for i, line in enumerate(lines):
+                    if line.strip().startswith('PublicKey') and peer_pubkey in line:
+                        for j in range(i-1, i-3, -1):
+                            if j >= 0 and lines[j].strip().lower().startswith('# client:'):
+                                client_comment = lines[j].strip()[9:].strip()
+                                break
+                        break
         if client_comment:
             message += f"📝 <b>Имя клиента:</b> {client_comment}\n"
         if config.get('peer'):
