@@ -354,41 +354,20 @@ class WireGuardBot:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         prev_peers = set()
-        prev_config_files = set()
         while True:
             try:
-                # Мониторинг активных peer'ов
                 current_peers = self.get_current_peers()
                 new_peers = current_peers - prev_peers
                 if new_peers:
                     for peer in new_peers:
                         config = self.get_peer_info(peer)
                         if config:
-                            loop.run_until_complete(
-                                self.send_new_client_notification(None, config, bot=bot)
-                            )
+                            loop.run_until_complete(self.send_new_client_notification(None, config, bot=bot))
                     prev_peers = current_peers
                 else:
                     prev_peers = current_peers
-                
-                # Мониторинг новых файлов конфигураций
-                current_config_files = set(self.get_wg_config_files())
-                new_config_files = current_config_files - prev_config_files
-                if new_config_files:
-                    for config_file in new_config_files:
-                        if config_file.endswith('.conf'):
-                            config_info = self.parse_config_file_info(f"/etc/wireguard/clients/{config_file}")
-                            if config_info:
-                                loop.run_until_complete(
-                                    self.send_new_client_notification(None, config_info, bot=bot)
-                                )
-                    prev_config_files = current_config_files
-                else:
-                    prev_config_files = current_config_files
-                
-                time.sleep(30)  # Проверяем каждые 30 секунд
+                time.sleep(60)
             except Exception as e:
-                logger.error(f"Ошибка в цикле мониторинга: {e}")
                 time.sleep(60)
 
     def run(self):
